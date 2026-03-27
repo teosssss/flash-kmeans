@@ -861,13 +861,21 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
     __pipeline_commit();
 
     __pipeline_wait_prior(1);
-    __syncthreads();
 
+    
     for (int block_col_start = 0; block_col_start < N; block_col_start += TILE_N) {
         for (int idx = tid; idx < TILE_N; idx += THREAD_COUNT) {
             s_c_norm[idx] = c_norm[block_col_start + idx];
         }
         __syncthreads();
+        
+        auto load_stage_half = [&](int stage, int reg_slot, int k_step) {
+            gemm_rotate3_load_stage_fragments_reg_pingpong_256_colb_MMA(
+                sA[stage], sB[stage], warp_row, warp_col, lane_id, reg_slot, k_step, a_regs, b_regs);
+        };
+        
+        load_stage_half(current_stage, reg_curr, 0);
+
 
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -883,19 +891,21 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
         const int outer_tile_idx = block_col_start / TILE_N;
         const bool has_next_centroid_tile = (outer_tile_idx + 1) < centroid_tile_count;
 
-        auto compute_current_stage = [&](void) {
-            gemm_rotate3_load_stage_fragments_reg_pingpong_256_colb_MMA(
-                sA[current_stage], sB[current_stage], warp_row, warp_col, lane_id, reg_curr, 0, a_regs, b_regs);
-            gemm_rotate3_load_stage_fragments_reg_pingpong_256_colb_MMA(
-                sA[current_stage], sB[current_stage], warp_row, warp_col, lane_id, reg_next, WMMA, a_regs, b_regs);
+        
 
-            gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_curr, a_regs, b_regs, c_regs);
-            gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_next, a_regs, b_regs, c_regs);
-        };
+        // GEMM-style register ping-pong:
+        // - preload reg_curr with the first half of the current K_TILE
+        // - in steady state:
+        //     load reg_next (second half of current stage)
+        //     mma reg_curr
+        //     prefetch k+2
+        //     rotate stages
+        //     load reg_curr (first half of new current stage)
+        //     mma reg_next
 
-        // Steady state: consume (j, k) while prefetching (j, k+2).
         for (int k_tile_idx = 0; k_tile_idx < k_tile_count - 2; ++k_tile_idx) {
-            compute_current_stage();
+            load_stage_half(current_stage, reg_next, WMMA);
+            gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_curr, a_regs, b_regs, c_regs);
 
             const int k_prefetch = (k_tile_idx + 2) * K_TILE;
             prefetch_a_stage_256x32_aligned(
@@ -907,10 +917,14 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
             __pipeline_wait_prior(1);
             __syncthreads();
             rotate_stage_triplet_3(current_stage, next_stage, prefetch_stage);
+
+            load_stage_half(current_stage, reg_curr, 0);
+            gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_next, a_regs, b_regs, c_regs);
         }
 
-        // Tail iteration 1: consume (j, k_count-2), optionally prefetch (j+1, 0).
-        compute_current_stage();
+        // Tail 1: consume slice k_count-2, optionally bootstrap next centroid tile k=0.
+        load_stage_half(current_stage, reg_next, WMMA);
+        gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_curr, a_regs, b_regs, c_regs);
         if (has_next_centroid_tile) {
             prefetch_a_stage_256x32_aligned(
                 A, sA[prefetch_stage], block_row_start, row_A, col_A, K, 0);
@@ -921,15 +935,25 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
         __pipeline_wait_prior(has_next_centroid_tile ? 1 : 0);
         __syncthreads();
         rotate_stage_triplet_3(current_stage, next_stage, prefetch_stage);
+        load_stage_half(current_stage, reg_curr, 0);
+        gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_next, a_regs, b_regs, c_regs);
 
-        // Tail iteration 2: consume (j, k_count-1), optionally prefetch (j+1, 1).
-        compute_current_stage();
+        // Tail 2: consume slice k_count-1, optionally bootstrap next centroid tile k=1.
+        load_stage_half(current_stage, reg_next, WMMA);
+        gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_curr, a_regs, b_regs, c_regs);
         if (has_next_centroid_tile) {
             prefetch_a_stage_256x32_aligned(
                 A, sA[prefetch_stage], block_row_start, row_A, col_A, K, K_TILE);
             prefetch_b_stage_128x32_aligned(
                 B_col_major, sB[prefetch_stage], block_col_start + TILE_N, row_B, col_B, K, K_TILE);
             __pipeline_commit();
+        }
+        gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_next, a_regs, b_regs, c_regs);
+
+        #pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            lane_row_min[r] = FLT_MAX;
+            lane_row_idx[r] = -1;
         }
 
         #pragma unroll
@@ -942,34 +966,15 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int col0 = warp_col + j * 8 + (lane_id % 4) * 2;
+                const int global_col0 = block_col_start + col0;
+                const int global_col1 = global_col0 + 1;
                 const float c_norm_col0 = s_c_norm[col0];
                 const float c_norm_col1 = s_c_norm[col0 + 1];
 
-                c_regs[i][j][0] = x_norm_row0 + c_norm_col0 - 2.0f * c_regs[i][j][0];
-                c_regs[i][j][1] = x_norm_row0 + c_norm_col1 - 2.0f * c_regs[i][j][1];
-                c_regs[i][j][2] = x_norm_row1 + c_norm_col0 - 2.0f * c_regs[i][j][2];
-                c_regs[i][j][3] = x_norm_row1 + c_norm_col1 - 2.0f * c_regs[i][j][3];
-            }
-        }
-
-        #pragma unroll
-        for (int r = 0; r < 8; ++r) {
-            lane_row_min[r] = FLT_MAX;
-            lane_row_idx[r] = -1;
-        }
-
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int col0 = warp_col + j * 8 + (lane_id % 4) * 2;
-                const int global_col0 = block_col_start + col0;
-                const int global_col1 = global_col0 + 1;
-
-                const float dist00 = c_regs[i][j][0];
-                const float dist01 = c_regs[i][j][1];
-                const float dist10 = c_regs[i][j][2];
-                const float dist11 = c_regs[i][j][3];
+                const float dist00 = fmaf(-2.0f, c_regs[i][j][0], x_norm_row0 + c_norm_col0);
+                const float dist01 = fmaf(-2.0f, c_regs[i][j][1], x_norm_row0 + c_norm_col1);
+                const float dist10 = fmaf(-2.0f, c_regs[i][j][2], x_norm_row1 + c_norm_col0);
+                const float dist11 = fmaf(-2.0f, c_regs[i][j][3], x_norm_row1 + c_norm_col1);
 
                 if (dist00 < lane_row_min[2 * i + 0]) {
                     lane_row_min[2 * i + 0] = dist00;
@@ -1048,7 +1053,6 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
 
         if (block_col_start + TILE_N < N) {
             __pipeline_wait_prior(1);
-            __syncthreads();
             rotate_stage_triplet_3(current_stage, next_stage, prefetch_stage);
         }
     }
