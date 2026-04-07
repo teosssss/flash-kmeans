@@ -102,6 +102,22 @@ python3 examples/benchmark_cuda_vs_triton.py \
   --out-dir /path/to/output_dir
 ```
 
+#### Representative Assignment Regimes
+
+We also grouped assignment-only CUDA vs Triton results into three representative regimes, analogous to the workload breakdown used in the Flash-KMeans paper: `large_m_large_n`, `large_m_small_n`, and `small_m_small_n`. This benchmark still measures only the assignment kernel, not end-to-end k-means.
+
+On a reduced Modal L4 sweep, CUDA won on all tested shapes in every regime:
+
+| Regime | Shapes | CUDA wins | Mean speedup | Geomean | Best speedup |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `large_m_large_n` | 4 | 4/4 | 1.370x | 1.367x | 1.506x |
+| `large_m_small_n` | 4 | 4/4 | 2.234x | 2.225x | 2.414x |
+| `small_m_small_n` | 4 | 4/4 | 2.413x | 2.220x | 3.381x |
+
+This regime view makes the trend clearer: the CUDA kernels still improve on Triton in large memory-intensive shapes, but the strongest gains show up in the lower-`N` or lower-centroid-count regimes where the CUDA path sustains much higher assignment throughput.
+
+![CUDA vs Triton representative regimes](assets/cuda_vs_triton_regimes_modal.svg)
+
 #### CUDA kernel notes
 
 | Kernel | Main optimization ideas |
