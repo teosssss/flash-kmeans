@@ -95,13 +95,11 @@ The exact best-vs-best results from this Modal run are:
 | `M=32,768 N=4,096 K=512` | `aligned_generic_main` | 2.671 | 5.048 | 1.890x |
 | `M=131,072 N=16,384 K=512` | `deferred_generic` | 36.332 | 59.092 | 1.626x |
 
-The full raw outputs for this run are under `artifacts/cuda_vs_triton_modal_13_final/`.
-
 This repository also includes a dedicated benchmark for rerunning or extending the comparison:
 
 ```bash
 python3 examples/benchmark_cuda_vs_triton.py \
-  --out-dir artifacts/cuda_vs_triton
+  --out-dir /path/to/output_dir
 ```
 
 The default sweep in `benchmark_cuda_vs_triton.py` matches the 13-shape Modal figure above:
@@ -112,10 +110,10 @@ The default sweep in `benchmark_cuda_vs_triton.py` matches the 13-shape Modal fi
 This is the canonical experiment used for the README summary and table.
 
 It writes:
-  - `artifacts/cuda_vs_triton/all_kernels.csv`: every CUDA kernel variant against Triton for every tested shape.
-  - `artifacts/cuda_vs_triton/best_vs_triton.csv`: the fastest CUDA kernel per shape.
-  - `artifacts/cuda_vs_triton/summary.md`: a ready-to-paste Markdown summary with mean/geomean/best advantage.
-  - `artifacts/cuda_vs_triton/best_vs_triton_speedup.svg`: a plot of `Triton time / CUDA time` per shape.
+  - `all_kernels.csv`: every CUDA kernel variant against Triton for every tested shape.
+  - `best_vs_triton.csv`: the fastest CUDA kernel per shape.
+  - `summary.md`: a ready-to-paste Markdown summary with mean/geomean/best advantage.
+  - `best_vs_triton_speedup.svg`: a plot of `Triton time / CUDA time` per shape.
 
 The main README figure intentionally stays best-vs-best. The full kernel sweep still lives in `all_kernels.csv` for anyone who wants the tuning details without cluttering the top-level story.
 
