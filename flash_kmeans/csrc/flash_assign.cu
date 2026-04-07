@@ -1,329 +1,8 @@
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <mma.h>
-#include <cuda/barrier>
-#include <cuda_pipeline_primitives.h>
+#include "flash_assign_common.cuh"
+#include "flash_assign_norm_kernels.cuh"
 
-#include <cfloat>
-#include <cstddef>
-
-using namespace nvcuda;
-
-#ifndef AUTOKERNEL_ENABLE_PERSISTENT_GEMM
-#define AUTOKERNEL_ENABLE_PERSISTENT_GEMM 0
-#endif
-
-// ------------- CONFIGURATION -------------
-constexpr int WARP_SIZE = 32;
-constexpr int THREAD_COUNT = 256;  // 8 warps -> 4x2 warp layout over a 256x128 CTA tile
-constexpr int WMMA = 16;
-constexpr int SPLIT_K = 4;
-#ifndef AUTOKERNEL_WS_PRODUCER_WARPS
-#define AUTOKERNEL_WS_PRODUCER_WARPS 3
-#endif
-#ifndef AUTOKERNEL_WS_CONSUMER_WARPS
-#define AUTOKERNEL_WS_CONSUMER_WARPS 4
-#endif
-constexpr int WARP_SPECIALIZED_PRODUCER_WARPS = AUTOKERNEL_WS_PRODUCER_WARPS;
-constexpr int WARP_SPECIALIZED_CONSUMER_WARPS = AUTOKERNEL_WS_CONSUMER_WARPS;
-constexpr int WARP_SPECIALIZED_THREAD_COUNT =
-    (WARP_SPECIALIZED_PRODUCER_WARPS + WARP_SPECIALIZED_CONSUMER_WARPS) * WARP_SIZE;
-
-#define LDMATRIX_X1(R, addr) \
-    asm volatile("ldmatrix.sync.aligned.x1.m8n8.shared.b16 {%0}, [%1];\n" : "=r"(R) : "r"(addr))
-
-#define LDMATRIX_X2(R0, R1, addr) \
-    asm volatile("ldmatrix.sync.aligned.x2.m8n8.shared.b16 {%0, %1}, [%2];\n" : "=r"(R0), "=r"(R1) : "r"(addr))
-
-#define LDMATRIX_X4(R0, R1, R2, R3, addr)                                             \
-    asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n" \
-                 : "=r"(R0), "=r"(R1), "=r"(R2), "=r"(R3)                             \
-                 : "r"(addr))
-
-#define HMMA16816_F32(RD0, RD1, RD2, RD3, RA0, RA1, RA2, RA3, RB0, RB1, RC0, RC1, RC2, RC3)                \
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "                                          \
-                 "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"                     \
-                 : "=f"(RD0), "=f"(RD1), "=f"(RD2), "=f"(RD3)                                                  \
-                 : "r"(RA0), "r"(RA1), "r"(RA2), "r"(RA3), "r"(RB0), "r"(RB1), "f"(RC0), "f"(RC1), "f"(RC2),\
-                   "f"(RC3))
-
-#if ((__CUDACC_VER_MAJOR__ == 11) && (__CUDACC_VER_MINOR__ >= 4)) || (__CUDACC_VER_MAJOR__ > 11)
-#define AUTOKERNEL_CP_ASYNC_CG(dst, src, Bytes) \
-    asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(dst), "l"(src), "n"(Bytes))
-#else
-#define AUTOKERNEL_CP_ASYNC_CG(dst, src, Bytes) \
-    asm volatile("cp.async.cg.shared.global [%0], [%1], %2;\n" ::"r"(dst), "l"(src), "n"(Bytes))
-#endif
-
-namespace {
-
-constexpr int PAD_A = 8;
-constexpr int PAD_B = 8;
-constexpr int K_TILE = 32;
-constexpr int TILE_M = 256;
-constexpr int TILE_N = 128;
-constexpr int A_STRIDE = K_TILE + PAD_A;
-constexpr int B_STRIDE = K_TILE + PAD_B;
-constexpr int A_STAGE_ELEMS = TILE_M * A_STRIDE;
-constexpr int B_STAGE_ELEMS = TILE_N * B_STRIDE;
-constexpr int STAGE_COUNT = 3;
-
-template <int kWarpSize = WARP_SIZE>
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        val += __shfl_down_sync(0xffffffffu, val, offset);
-    }
-    return val;
-}
-
-__device__ __forceinline__ void cp_async_cg_16B(void* dst, const void* src) {
-    uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
-    AUTOKERNEL_CP_ASYNC_CG(smem_addr, src, 16);
-}
-
-__device__ __forceinline__ void zero_16B(half* dst) {
-    uint4 zeros = make_uint4(0u, 0u, 0u, 0u);
-    *reinterpret_cast<uint4*>(dst) = zeros;
-}
-
-__device__ __forceinline__ void rotate_stage_triplet_3(int& current_stage, int& next_stage, int& prefetch_stage) {
-    const int old_current = current_stage;
-    current_stage = next_stage;
-    next_stage = prefetch_stage;
-    prefetch_stage = old_current;
-}
-
-__device__ __forceinline__ void prefetch_a_stage_256x32(
-    const half* A,
-    half* sA_stage,
-    int block_row_start,
-    int row_A,
-    int col_A,
-    int K,
-    int k_base,
-    int M
-) {
-    // Each thread owns one 16-byte vector per 64-row pass. Together the CTA covers
-    // a full 256x32 slice of the point tile for the current K_TILE position.
-    #pragma unroll
-    for (int pass = 0; pass < 4; ++pass) {
-        const int local_row = pass * 64 + row_A;
-        half* dst = sA_stage + local_row * A_STRIDE + col_A;
-        const int global_row = block_row_start + local_row;
-        const int global_col = k_base + col_A;
-
-        if (global_row < M && (global_col + 7) < K) {
-            const half* src = A + global_row * K + global_col;
-            cp_async_cg_16B(dst, src);
-        } else {
-            // Tail handling is explicit so the ldmatrix path always sees valid shared data.
-            // This is only taken on edge tiles along M or K.
-            if (global_row < M) {
-                #pragma unroll
-                for (int t = 0; t < 8; ++t) {
-                    const int d = global_col + t;
-                    dst[t] = (d < K) ? A[global_row * K + d] : __float2half(0.0f);
-                }
-            } else {
-                zero_16B(dst);
-            }
-        }
-    }
-}
-
-__device__ __forceinline__ void prefetch_b_stage_128x32(
-    const half* B_col_major,
-    half* sB_stage,
-    int block_col_start,
-    int row_B,
-    int col_B,
-    int K,
-    int k_base,
-    int N
-) {
-    // Each thread owns one 16-byte vector per 64-row pass. Together the CTA covers
-    // a full 128x32 slice of the centroid tile for the current K_TILE position.
-    #pragma unroll
-    for (int pass = 0; pass < 2; ++pass) {
-        const int local_row = pass * 64 + row_B;
-        half* dst = sB_stage + local_row * B_STRIDE + col_B;
-        const int global_row = block_col_start + local_row;
-        const int global_col = k_base + col_B;
-
-        if (global_row < N && (global_col + 7) < K) {
-            const half* src = B_col_major + global_row * K + global_col;
-            cp_async_cg_16B(dst, src);
-        } else {
-            // Tail handling mirrors the A path so partial centroid tiles are still safe.
-            if (global_row < N) {
-                #pragma unroll
-                for (int t = 0; t < 8; ++t) {
-                    const int d = global_col + t;
-                    dst[t] = (d < K) ? B_col_major[global_row * K + d] : __float2half(0.0f);
-                }
-            } else {
-                zero_16B(dst);
-            }
-        }
-    }
-}
-
-__device__ __forceinline__ void prefetch_a_stage_256x32_aligned(
-    const half* A,
-    half* sA_stage,
-    int block_row_start,
-    int row_A,
-    int col_A,
-    int K,
-    int k_base
-) {
-    #pragma unroll
-    for (int pass = 0; pass < 4; ++pass) {
-        const int local_row = pass * 64 + row_A;
-        half* dst = sA_stage + local_row * A_STRIDE + col_A;
-        const half* src = A + (block_row_start + local_row) * K + (k_base + col_A);
-        cp_async_cg_16B(dst, src);
-    }
-}
-
-__device__ __forceinline__ void prefetch_b_stage_128x32_aligned(
-    const half* B_col_major,
-    half* sB_stage,
-    int block_col_start,
-    int row_B,
-    int col_B,
-    int K,
-    int k_base
-) {
-    #pragma unroll
-    for (int pass = 0; pass < 2; ++pass) {
-        const int local_row = pass * 64 + row_B;
-        half* dst = sB_stage + local_row * B_STRIDE + col_B;
-        const half* src = B_col_major + (block_col_start + local_row) * K + (k_base + col_B);
-        cp_async_cg_16B(dst, src);
-    }
-}
-
-__device__ __forceinline__ void gemm_rotate3_load_stage_fragments_reg_pingpong_256_colb_MMA(
-    const half* sA_stage,
-    const half* sB_stage,
-    int warp_row,
-    int warp_col,
-    int lane_id,
-    int reg_slot,
-    int k_step,
-    uint32_t (&a_regs)[2][4][4],
-    uint32_t (&b_regs)[2][8][2]
-) {
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        const int smem_row = warp_row + i * 16;
-        const half* tile_ptr_A =
-            sA_stage + (smem_row + (lane_id % 16)) * A_STRIDE + k_step + (lane_id / 16) * 8;
-        const uint32_t A_smem_lane_addr = static_cast<uint32_t>(__cvta_generic_to_shared(tile_ptr_A));
-        LDMATRIX_X4(
-            a_regs[reg_slot][i][0],
-            a_regs[reg_slot][i][1],
-            a_regs[reg_slot][i][2],
-            a_regs[reg_slot][i][3],
-            A_smem_lane_addr
-        );
-    }
-
-    #pragma unroll
-    for (int j = 0; j < 8; j++) {
-        const int smem_col = warp_col + j * 8;
-        const half* tile_ptr_B =
-            sB_stage + (smem_col + (lane_id % 8)) * B_STRIDE + k_step + ((lane_id / 8) % 2) * 8;
-        const uint32_t B_smem_lane_addr = static_cast<uint32_t>(__cvta_generic_to_shared(tile_ptr_B));
-        LDMATRIX_X2(
-            b_regs[reg_slot][j][0],
-            b_regs[reg_slot][j][1],
-            B_smem_lane_addr
-        );
-    }
-}
-
-__device__ __forceinline__ void gemm_rotate3_mma_reg_pingpong_256_colb_MMA(
-    int reg_slot,
-    uint32_t (&a_regs)[2][4][4],
-    uint32_t (&b_regs)[2][8][2],
-    float (&c_regs)[4][8][4]
-) {
-    #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            const int j_s = (i % 2) ? (8 - j - 1) : j;
-            float d0, d1, d2, d3;
-            HMMA16816_F32(
-                d0,
-                d1,
-                d2,
-                d3,
-                a_regs[reg_slot][i][0],
-                a_regs[reg_slot][i][1],
-                a_regs[reg_slot][i][2],
-                a_regs[reg_slot][i][3],
-                b_regs[reg_slot][j_s][0],
-                b_regs[reg_slot][j_s][1],
-                c_regs[i][j_s][0],
-                c_regs[i][j_s][1],
-                c_regs[i][j_s][2],
-                c_regs[i][j_s][3]
-            );
-            c_regs[i][j_s][0] = d0;
-            c_regs[i][j_s][1] = d1;
-            c_regs[i][j_s][2] = d2;
-            c_regs[i][j_s][3] = d3;
-        }
-    }
-}
-
-}  // namespace
-
-template <int NUM_THREADS = THREAD_COUNT>
-__global__ void row_l2_norm_kernel(
-    const half* __restrict__ x,
-    float* __restrict__ norms,
-    int rows,
-    int cols
-) {
-    const int row = blockIdx.x;
-    const int tid = threadIdx.x;
-    if (row >= rows) {
-        return;
-    }
-
-    float sum = 0.0f;
-
-    // Each thread walks the row with a block-stride loop so the kernel works for any cols.
-    for (int col = tid; col < cols; col += NUM_THREADS) {
-        const float v = __half2float(x[row * cols + col]);
-        sum += v * v;
-    }
-
-    sum = warp_reduce_sum(sum);
-
-    constexpr int NUM_WARPS = NUM_THREADS / WARP_SIZE;
-    __shared__ float warp_sums[NUM_WARPS];
-
-    const int lane = tid % WARP_SIZE;
-    const int warp = tid / WARP_SIZE;
-
-    if (lane == 0) {
-        warp_sums[warp] = sum;
-    }
-    __syncthreads();
-
-    if (warp == 0) {
-        float block_sum = (lane < NUM_WARPS) ? warp_sums[lane] : 0.0f;
-        block_sum = warp_reduce_sum(block_sum);
-        if (lane == 0) {
-            norms[row] = block_sum;
-        }
-    }
+__device__ __forceinline__ int x_norm_pair_index_256x128(int row0) {
+    return ((row0 >> 4) << 3) + (row0 & 7);
 }
 
 __global__ void flash_assign_kernel_256x128x32(
@@ -387,11 +66,11 @@ __global__ void flash_assign_kernel_256x128x32(
     //   tile once per CTA before entering the loop
     // - centroid norms depend on the current 128-column centroid tile, so load them inside
     //   the outer loop at the beginning of each iteration
-    for (int idx = tid; idx < TILE_M; idx += THREAD_COUNT) {
-        const int global_row = block_row_start + idx;
-        s_x_norm[idx] = (global_row < M) ? x_norm[global_row] : 0.0f;
-        s_running_best_dist[idx] = FLT_MAX;
-        s_running_best_idx[idx] = -1;
+    if (tid < TILE_M) {
+        const int global_row = block_row_start + tid;
+        s_x_norm[tid] = (global_row < M) ? x_norm[global_row] : 0.0f;
+        s_running_best_dist[tid] = FLT_MAX;
+        s_running_best_idx[tid] = -1;
     }
     __syncthreads();
 
@@ -431,9 +110,9 @@ __global__ void flash_assign_kernel_256x128x32(
     // Walk centroid tiles along N. Each iteration computes the dot-product tile
     // between one fixed point tile [256, K] and one centroid tile [128, K].
     for (int block_col_start = 0; block_col_start < N; block_col_start += TILE_N) {
-        for (int idx = tid; idx < TILE_N; idx += THREAD_COUNT) {
-            const int global_col = block_col_start + idx;
-            s_c_norm[idx] = (global_col < N) ? c_norm[global_col] : 0.0f;
+        if (tid < TILE_N) {
+            const int global_col = block_col_start + tid;
+            s_c_norm[tid] = (global_col < N) ? c_norm[global_col] : 0.0f;
         }
         __syncthreads();
 
@@ -822,8 +501,8 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
     extern __shared__ half smem[];
     auto sA = reinterpret_cast<half (*)[A_STAGE_ELEMS]>(smem);
     auto sB = reinterpret_cast<half (*)[B_STAGE_ELEMS]>(smem + STAGE_COUNT * A_STAGE_ELEMS);
-    float* s_x_norm = reinterpret_cast<float*>(smem + STAGE_COUNT * A_STAGE_ELEMS + STAGE_COUNT * B_STAGE_ELEMS);
-    float* s_c_norm = s_x_norm + TILE_M;
+    float2* s_x_norm_pairs = reinterpret_cast<float2*>(smem + STAGE_COUNT * A_STAGE_ELEMS + STAGE_COUNT * B_STAGE_ELEMS);
+    float* s_c_norm = reinterpret_cast<float*>(s_x_norm_pairs + (TILE_M / 2));
     float* s_running_best_dist = s_c_norm + TILE_N;
     int* s_running_best_idx = reinterpret_cast<int*>(s_running_best_dist + TILE_M);
     float* s_warp_row_min = reinterpret_cast<float*>(s_running_best_idx + TILE_M);
@@ -835,11 +514,18 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
     float lane_row_min[8];
     int lane_row_idx[8];
 
-    #pragma unroll
-    for (int idx = tid; idx < TILE_M; idx += THREAD_COUNT) {
-        s_x_norm[idx] = x_norm[block_row_start + idx];
-        s_running_best_dist[idx] = FLT_MAX;
-        s_running_best_idx[idx] = -1;
+    if (tid < TILE_M / 2) {
+        const int row0 = (tid >> 3) * 16 + (tid & 7);
+        const int row1 = row0 + 8;
+        s_x_norm_pairs[tid] = make_float2(
+            x_norm[block_row_start + row0],
+            x_norm[block_row_start + row1]);
+        s_running_best_dist[tid] = FLT_MAX;
+        s_running_best_idx[tid] = -1;
+    }
+    if (tid + (TILE_M / 2) < TILE_M) {
+        s_running_best_dist[tid + (TILE_M / 2)] = FLT_MAX;
+        s_running_best_idx[tid + (TILE_M / 2)] = -1;
     }
     __syncthreads();
 
@@ -862,9 +548,9 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
     __pipeline_wait_prior(1);
 
     for (int block_col_start = 0; block_col_start < N; block_col_start += TILE_N) {
-        #pragma unroll
-        for (int idx = tid; idx < TILE_N; idx += THREAD_COUNT) {
-            s_c_norm[idx] = c_norm[block_col_start + idx];
+        if (tid < TILE_N / 2) {
+            reinterpret_cast<float2*>(s_c_norm)[tid] =
+                reinterpret_cast<const float2*>(&c_norm[block_col_start])[tid];
         }
         __syncthreads();
 
@@ -948,35 +634,45 @@ __global__ void flash_assign_kernel_256x128x32_aligned(
             int row_idx1 = lane_row_idx[2 * i + 1];
             const int row0 = warp_row + i * 16 + lane_id / 4;
             const int row1 = row0 + 8;
-            const float x_norm_row0 = s_x_norm[row0];
-            const float x_norm_row1 = s_x_norm[row1];
+            const float2 x_norm_pair = s_x_norm_pairs[x_norm_pair_index_256x128(row0)];
+            const float x_norm_row0 = x_norm_pair.x;
+            const float x_norm_row1 = x_norm_pair.y;
 
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int col0 = warp_col + j * 8 + (lane_id % 4) * 2;
                 const int global_col0 = block_col_start + col0;
                 const int global_col1 = global_col0 + 1;
-                const float c_norm_col0 = s_c_norm[col0];
-                const float c_norm_col1 = s_c_norm[col0 + 1];
+                const float2 c_norm_pair = reinterpret_cast<const float2*>(s_c_norm)[col0 >> 1];
+                const float c_norm_col0 = c_norm_pair.x;
+                const float c_norm_col1 = c_norm_pair.y;
 
                 const float dist00 = fmaf(-2.0f, c_regs[i][j][0], x_norm_row0 + c_norm_col0);
                 const float dist01 = fmaf(-2.0f, c_regs[i][j][1], x_norm_row0 + c_norm_col1);
                 const float dist10 = fmaf(-2.0f, c_regs[i][j][2], x_norm_row1 + c_norm_col0);
                 const float dist11 = fmaf(-2.0f, c_regs[i][j][3], x_norm_row1 + c_norm_col1);
 
-                const bool pick01 = dist01 < dist00;
-                const float cand0 = pick01 ? dist01 : dist00;
-                const int cand_idx0 = pick01 ? global_col1 : global_col0;
-                const bool pick11 = dist11 < dist10;
-                const float cand1 = pick11 ? dist11 : dist10;
-                const int cand_idx1 = pick11 ? global_col1 : global_col0;
+                float cand0 = dist00;
+                int cand_idx0 = global_col0;
+                if (dist01 < cand0) {
+                    cand0 = dist01;
+                    cand_idx0 = global_col1;
+                }
+                float cand1 = dist10;
+                int cand_idx1 = global_col0;
+                if (dist11 < cand1) {
+                    cand1 = dist11;
+                    cand_idx1 = global_col1;
+                }
 
-                const bool update0 = cand0 < row_min0;
-                row_min0 = update0 ? cand0 : row_min0;
-                row_idx0 = update0 ? cand_idx0 : row_idx0;
-                const bool update1 = cand1 < row_min1;
-                row_min1 = update1 ? cand1 : row_min1;
-                row_idx1 = update1 ? cand_idx1 : row_idx1;
+                if (cand0 < row_min0) {
+                    row_min0 = cand0;
+                    row_idx0 = cand_idx0;
+                }
+                if (cand1 < row_min1) {
+                    row_min1 = cand1;
+                    row_idx1 = cand_idx1;
+                }
             }
 
             lane_row_min[2 * i + 0] = row_min0;
@@ -1085,8 +781,8 @@ __global__ void flash_assign_kernel_256x128x32_aligned_static_k(
     extern __shared__ half smem[];
     auto sA = reinterpret_cast<half (*)[A_STAGE_ELEMS]>(smem);
     auto sB = reinterpret_cast<half (*)[B_STAGE_ELEMS]>(smem + STAGE_COUNT * A_STAGE_ELEMS);
-    float* s_x_norm = reinterpret_cast<float*>(smem + STAGE_COUNT * A_STAGE_ELEMS + STAGE_COUNT * B_STAGE_ELEMS);
-    float* s_c_norm = s_x_norm + TILE_M;
+    float2* s_x_norm_pairs = reinterpret_cast<float2*>(smem + STAGE_COUNT * A_STAGE_ELEMS + STAGE_COUNT * B_STAGE_ELEMS);
+    float* s_c_norm = reinterpret_cast<float*>(s_x_norm_pairs + (TILE_M / 2));
     float* s_running_best_dist = s_c_norm + TILE_N;
     int* s_running_best_idx = reinterpret_cast<int*>(s_running_best_dist + TILE_M);
     float* s_warp_row_min = reinterpret_cast<float*>(s_running_best_idx + TILE_M);
@@ -1098,11 +794,18 @@ __global__ void flash_assign_kernel_256x128x32_aligned_static_k(
     float lane_row_min[8];
     int lane_row_idx[8];
 
-    #pragma unroll
-    for (int idx = tid; idx < TILE_M; idx += THREAD_COUNT) {
-        s_x_norm[idx] = x_norm[block_row_start + idx];
-        s_running_best_dist[idx] = FLT_MAX;
-        s_running_best_idx[idx] = -1;
+    if (tid < TILE_M / 2) {
+        const int row0 = (tid >> 3) * 16 + (tid & 7);
+        const int row1 = row0 + 8;
+        s_x_norm_pairs[tid] = make_float2(
+            x_norm[block_row_start + row0],
+            x_norm[block_row_start + row1]);
+        s_running_best_dist[tid] = FLT_MAX;
+        s_running_best_idx[tid] = -1;
+    }
+    if (tid + (TILE_M / 2) < TILE_M) {
+        s_running_best_dist[tid + (TILE_M / 2)] = FLT_MAX;
+        s_running_best_idx[tid + (TILE_M / 2)] = -1;
     }
     __syncthreads();
 
@@ -1128,9 +831,9 @@ __global__ void flash_assign_kernel_256x128x32_aligned_static_k(
 
     
     for (int block_col_start = 0; block_col_start < N; block_col_start += TILE_N) {
-        #pragma unroll
-        for (int idx = tid; idx < TILE_N; idx += THREAD_COUNT) {
-            s_c_norm[idx] = c_norm[block_col_start + idx];
+        if (tid < TILE_N / 2) {
+            reinterpret_cast<float2*>(s_c_norm)[tid] =
+                reinterpret_cast<const float2*>(&c_norm[block_col_start])[tid];
         }
         __syncthreads();
         
@@ -1224,22 +927,23 @@ __global__ void flash_assign_kernel_256x128x32_aligned_static_k(
 
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
+            const int row0 = warp_row + i * 16 + lane_id / 4;
             float row_min0 = lane_row_min[2 * i + 0];
             float row_min1 = lane_row_min[2 * i + 1];
             int row_idx0 = lane_row_idx[2 * i + 0];
             int row_idx1 = lane_row_idx[2 * i + 1];
-            const int row0 = warp_row + i * 16 + lane_id / 4;
-            const int row1 = row0 + 8;
-            const float x_norm_row0 = s_x_norm[row0];
-            const float x_norm_row1 = s_x_norm[row1];
+            const float2 x_norm_pair = s_x_norm_pairs[x_norm_pair_index_256x128(row0)];
+            const float x_norm_row0 = x_norm_pair.x;
+            const float x_norm_row1 = x_norm_pair.y;
 
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int col0 = warp_col + j * 8 + (lane_id % 4) * 2;
                 const int global_col0 = block_col_start + col0;
                 const int global_col1 = global_col0 + 1;
-                const float c_norm_col0 = s_c_norm[col0];
-                const float c_norm_col1 = s_c_norm[col0 + 1];
+                const float2 c_norm_pair = reinterpret_cast<const float2*>(s_c_norm)[col0 >> 1];
+                const float c_norm_col0 = c_norm_pair.x;
+                const float c_norm_col1 = c_norm_pair.y;
 
                 const float dist00 = fmaf(-2.0f, c_regs[i][j][0], x_norm_row0 + c_norm_col0);
                 const float dist01 = fmaf(-2.0f, c_regs[i][j][1], x_norm_row0 + c_norm_col1);
@@ -1366,8 +1070,8 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce(
     extern __shared__ half smem[];
     auto sA = reinterpret_cast<half (*)[A_STAGE_ELEMS]>(smem);
     auto sB = reinterpret_cast<half (*)[B_STAGE_ELEMS]>(smem + STAGE_COUNT * A_STAGE_ELEMS);
-    float* s_x_norm = reinterpret_cast<float*>(smem + STAGE_COUNT * A_STAGE_ELEMS + STAGE_COUNT * B_STAGE_ELEMS);
-    float* s_c_norm = s_x_norm + TILE_M;
+    float2* s_x_norm_pairs = reinterpret_cast<float2*>(smem + STAGE_COUNT * A_STAGE_ELEMS + STAGE_COUNT * B_STAGE_ELEMS);
+    float* s_c_norm = reinterpret_cast<float*>(s_x_norm_pairs + (TILE_M / 2));
     float* s_warp_row_min = reinterpret_cast<float*>(s_c_norm + TILE_N);
     int* s_warp_row_idx = reinterpret_cast<int*>(s_warp_row_min + 8 * 64);
 
@@ -1376,9 +1080,12 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce(
     float c_regs[4][8][4];
     float lane_row_min[8];
     int lane_row_idx[8];
-
-    for (int idx = tid; idx < TILE_M; idx += THREAD_COUNT) {
-        s_x_norm[idx] = x_norm[block_row_start + idx];
+    if (tid < TILE_M / 2) {
+        const int row0 = (tid >> 3) * 16 + (tid & 7);
+        const int row1 = row0 + 8;
+        s_x_norm_pairs[tid] = make_float2(
+            x_norm[block_row_start + row0],
+            x_norm[block_row_start + row1]);
     }
     __syncthreads();
 
@@ -1404,32 +1111,42 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce(
     __pipeline_commit();
     __pipeline_wait_prior(1);
 
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            c_regs[i][j][0] = 0.0f;
-            c_regs[i][j][1] = 0.0f;
-            c_regs[i][j][2] = 0.0f;
-            c_regs[i][j][3] = 0.0f;
-        }
-    }
 
-    for (int block_col_start = 0; block_col_start < N; block_col_start += TILE_N) {
-        for (int idx = tid; idx < TILE_N; idx += THREAD_COUNT) {
-            s_c_norm[idx] = c_norm[block_col_start + idx];
-        }
-        __syncthreads();
-
-        const int outer_tile_idx = block_col_start / TILE_N;
-        const bool has_next_centroid_tile = (outer_tile_idx + 1) < centroid_tile_count;
-
-        auto load_stage_half = [&](int stage, int reg_slot, int k_step) {
+    auto load_stage_half = [&](int stage, int reg_slot, int k_step) {
             gemm_rotate3_load_stage_fragments_reg_pingpong_256_colb_MMA(
                 sA[stage], sB[stage], warp_row, warp_col, lane_id, reg_slot, k_step, a_regs, b_regs);
         };
 
+
+
+    for (int block_col_start = 0; block_col_start < N; block_col_start += TILE_N) {
+        if (tid < TILE_N / 2) {
+            reinterpret_cast<float2*>(s_c_norm)[tid] =
+                reinterpret_cast<const float2*>(&c_norm[block_col_start])[tid];
+        }
+        __syncthreads();
+
+       
+
+        
+
         load_stage_half(current_stage, reg_curr, 0);
+
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                c_regs[i][j][0] = 0.0f;
+                c_regs[i][j][1] = 0.0f;
+                c_regs[i][j][2] = 0.0f;
+                c_regs[i][j][3] = 0.0f;
+            }
+        }
+
+
+        const int outer_tile_idx = block_col_start / TILE_N;
+        const bool has_next_centroid_tile = (outer_tile_idx + 1) < centroid_tile_count;
 
         for (int k_tile_idx = 0; k_tile_idx < k_tile_count - 2; ++k_tile_idx) {
             load_stage_half(current_stage, reg_next, WMMA);
@@ -1478,22 +1195,23 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce(
 
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
+            const int row0 = warp_row + i * 16 + lane_id / 4;
+            const float2 x_norm_pair = s_x_norm_pairs[x_norm_pair_index_256x128(row0)];
+            const float x_norm_row0 = x_norm_pair.x;
+            const float x_norm_row1 = x_norm_pair.y;
             float row_min0 = lane_row_min[2 * i + 0];
             float row_min1 = lane_row_min[2 * i + 1];
             int row_idx0 = lane_row_idx[2 * i + 0];
             int row_idx1 = lane_row_idx[2 * i + 1];
-            const int row0 = warp_row + i * 16 + lane_id / 4;
-            const int row1 = row0 + 8;
-            const float x_norm_row0 = s_x_norm[row0];
-            const float x_norm_row1 = s_x_norm[row1];
 
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
                 const int col0 = warp_col + j * 8 + (lane_id % 4) * 2;
+                const float2 c_norm_pair = reinterpret_cast<const float2*>(s_c_norm)[col0 >> 1];
+                const float c_norm_col0 = c_norm_pair.x;
+                const float c_norm_col1 = c_norm_pair.y;
                 const int global_col0 = block_col_start + col0;
                 const int global_col1 = global_col0 + 1;
-                const float c_norm_col0 = s_c_norm[col0];
-                const float c_norm_col1 = s_c_norm[col0 + 1];
 
                 const float dist00 = fmaf(-2.0f, c_regs[i][j][0], x_norm_row0 + c_norm_col0);
                 const float dist01 = fmaf(-2.0f, c_regs[i][j][1], x_norm_row0 + c_norm_col1);
@@ -1521,16 +1239,6 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce(
             lane_row_idx[2 * i + 1] = row_idx1;
         }
 
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                c_regs[i][j][0] = 0.0f;
-                c_regs[i][j][1] = 0.0f;
-                c_regs[i][j][2] = 0.0f;
-                c_regs[i][j][3] = 0.0f;
-            }
-        }
 
         if (block_col_start + TILE_N < N) {
             __pipeline_wait_prior(1);
@@ -1629,8 +1337,8 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce_static_k(
     extern __shared__ half smem[];
     auto sA = reinterpret_cast<half (*)[A_STAGE_ELEMS]>(smem);
     auto sB = reinterpret_cast<half (*)[B_STAGE_ELEMS]>(smem + STAGE_COUNT * A_STAGE_ELEMS);
-    float* s_x_norm = reinterpret_cast<float*>(smem + STAGE_COUNT * A_STAGE_ELEMS + STAGE_COUNT * B_STAGE_ELEMS);
-    float* s_c_norm = s_x_norm + TILE_M;
+    float2* s_x_norm_pairs = reinterpret_cast<float2*>(smem + STAGE_COUNT * A_STAGE_ELEMS + STAGE_COUNT * B_STAGE_ELEMS);
+    float* s_c_norm = reinterpret_cast<float*>(s_x_norm_pairs + (TILE_M / 2));
     float* s_warp_row_min = reinterpret_cast<float*>(s_c_norm + TILE_N);
     int* s_warp_row_idx = reinterpret_cast<int*>(s_warp_row_min + 8 * 64);
 
@@ -1639,9 +1347,12 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce_static_k(
     float c_regs[4][8][4];
     float lane_row_min[8];
     int lane_row_idx[8];
-    #pragma unroll
-    for (int idx = tid; idx < TILE_M; idx += THREAD_COUNT) {
-        s_x_norm[idx] = x_norm[block_row_start + idx];
+    if (tid < TILE_M / 2) {
+        const int row0 = (tid >> 3) * 16 + (tid & 7);
+        const int row1 = row0 + 8;
+        s_x_norm_pairs[tid] = make_float2(
+            x_norm[block_row_start + row0],
+            x_norm[block_row_start + row1]);
     }
     __syncthreads();
 
@@ -1668,7 +1379,26 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce_static_k(
     __pipeline_wait_prior(1);
 
 
-    #pragma unroll
+
+    for (int block_col_start = 0; block_col_start < N; block_col_start += TILE_N) {
+        if (tid < TILE_N / 2) {
+            reinterpret_cast<float2*>(s_c_norm)[tid] =
+                reinterpret_cast<const float2*>(&c_norm[block_col_start])[tid];
+        }
+        __syncthreads();
+
+        
+
+
+        auto load_stage_half = [&](int stage, int reg_slot, int k_step) {
+            gemm_rotate3_load_stage_fragments_reg_pingpong_256_colb_MMA(
+                sA[stage], sB[stage], warp_row, warp_col, lane_id, reg_slot, k_step, a_regs, b_regs);
+        };
+
+        load_stage_half(current_stage, reg_curr, 0);
+
+
+        #pragma unroll
         for (int i = 0; i < 4; ++i) {
             #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -1679,26 +1409,11 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce_static_k(
             }
         }
 
-    for (int block_col_start = 0; block_col_start < N; block_col_start += TILE_N) {
-        #pragma unroll
-        for (int idx = tid; idx < TILE_N; idx += THREAD_COUNT) {
-            s_c_norm[idx] = c_norm[block_col_start + idx];
-        }
-        __syncthreads();
-
-        
-
         const int outer_tile_idx = block_col_start / TILE_N;
         const bool has_next_centroid_tile = (outer_tile_idx + 1) < centroid_tile_count;
 
-        auto load_stage_half = [&](int stage, int reg_slot, int k_step) {
-            gemm_rotate3_load_stage_fragments_reg_pingpong_256_colb_MMA(
-                sA[stage], sB[stage], warp_row, warp_col, lane_id, reg_slot, k_step, a_regs, b_regs);
-        };
 
-        load_stage_half(current_stage, reg_curr, 0);
 
-        #pragma unroll
         for (int k_tile_idx = 0; k_tile_idx < k_tile_count - 2; ++k_tile_idx) {
             load_stage_half(current_stage, reg_next, WMMA);
             gemm_rotate3_mma_reg_pingpong_256_colb_MMA(reg_curr, a_regs, b_regs, c_regs);
@@ -1746,42 +1461,53 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce_static_k(
 
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
+            const int row0 = warp_row + i * 16 + lane_id / 4;
             float row_min0 = lane_row_min[2 * i + 0];
             float row_min1 = lane_row_min[2 * i + 1];
             int row_idx0 = lane_row_idx[2 * i + 0];
             int row_idx1 = lane_row_idx[2 * i + 1];
-            const int row0 = warp_row + i * 16 + lane_id / 4;
-            const int row1 = row0 + 8;
-            const float x_norm_row0 = s_x_norm[row0];
-            const float x_norm_row1 = s_x_norm[row1];
+            const float2 x_norm_pair = s_x_norm_pairs[x_norm_pair_index_256x128(row0)];
+            const float x_norm_row0 = x_norm_pair.x;
+            const float x_norm_row1 = x_norm_pair.y;
 
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                const int col0 = warp_col + j * 8 + (lane_id % 4) * 2;
-                const int global_col0 = block_col_start + col0;
-                const int global_col1 = global_col0 + 1;
-                const float c_norm_col0 = s_c_norm[col0];
-                const float c_norm_col1 = s_c_norm[col0 + 1];
 
-                const float dist00 = fmaf(-2.0f, c_regs[i][j][0], x_norm_row0 + c_norm_col0);
-                const float dist01 = fmaf(-2.0f, c_regs[i][j][1], x_norm_row0 + c_norm_col1);
-                const float dist10 = fmaf(-2.0f, c_regs[i][j][2], x_norm_row1 + c_norm_col0);
-                const float dist11 = fmaf(-2.0f, c_regs[i][j][3], x_norm_row1 + c_norm_col1);
+                #pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int col0 = warp_col + j * 8 + (lane_id % 4) * 2;
+                    const int global_col0 = block_col_start + col0;
+                    const int global_col1 = global_col0 + 1;
+                    const float2 c_norm_pair = reinterpret_cast<const float2*>(s_c_norm)[col0 >> 1];
+                    const float c_norm_col0 = c_norm_pair.x;
+                    const float c_norm_col1 = c_norm_pair.y;
 
-                const bool pick01 = dist01 < dist00;
-                const float cand0 = pick01 ? dist01 : dist00;
-                const int cand_idx0 = pick01 ? global_col1 : global_col0;
-                const bool pick11 = dist11 < dist10;
-                const float cand1 = pick11 ? dist11 : dist10;
-                const int cand_idx1 = pick11 ? global_col1 : global_col0;
+                    const float dist00 = fmaf(-2.0f, c_regs[i][j][0], x_norm_row0 + c_norm_col0);
+                    const float dist01 = fmaf(-2.0f, c_regs[i][j][1], x_norm_row0 + c_norm_col1);
+                    const float dist10 = fmaf(-2.0f, c_regs[i][j][2], x_norm_row1 + c_norm_col0);
+                    const float dist11 = fmaf(-2.0f, c_regs[i][j][3], x_norm_row1 + c_norm_col1);
 
-                const bool update0 = cand0 < row_min0;
-                row_min0 = update0 ? cand0 : row_min0;
-                row_idx0 = update0 ? cand_idx0 : row_idx0;
-                const bool update1 = cand1 < row_min1;
-                row_min1 = update1 ? cand1 : row_min1;
-                row_idx1 = update1 ? cand_idx1 : row_idx1;
-            }
+                    float cand0 = dist00;
+                    int cand_idx0 = global_col0;
+                    if (dist01 < cand0) {
+                        cand0 = dist01;
+                        cand_idx0 = global_col1;
+                    }
+                    float cand1 = dist10;
+                    int cand_idx1 = global_col0;
+                    if (dist11 < cand1) {
+                        cand1 = dist11;
+                        cand_idx1 = global_col1;
+                    }
+
+                    if (cand0 < row_min0) {
+                        row_min0 = cand0;
+                        row_idx0 = cand_idx0;
+                    }
+                    if (cand1 < row_min1) {
+                        row_min1 = cand1;
+                        row_idx1 = cand_idx1;
+                    }
+                
+                }
 
             lane_row_min[2 * i + 0] = row_min0;
             lane_row_idx[2 * i + 0] = row_idx0;
@@ -1791,16 +1517,7 @@ __global__ void flash_assign_kernel_256x128x32_aligned_deferred_reduce_static_k(
 
 
 
-        #pragma unroll
-        for (int i = 0; i < 4; ++i) {
-            #pragma unroll
-            for (int j = 0; j < 8; ++j) {
-                c_regs[i][j][0] = 0.0f;
-                c_regs[i][j][1] = 0.0f;
-                c_regs[i][j][2] = 0.0f;
-                c_regs[i][j][3] = 0.0f;
-            }
-        }
+    
 
         if (block_col_start + TILE_N < N) {
             __pipeline_wait_prior(1);
@@ -2086,6 +1803,196 @@ cudaError_t launch_flash_assign_kernel_256x128x32_aligned_deferred_reduce(
             break;
     }
     return cudaGetLastError();
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_generic(
+    const half* A,
+    const half* B_col_major,
+    const float* x_norm,
+    const float* c_norm,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+) {
+    const dim3 block(THREAD_COUNT);
+    const dim3 grid((M + TILE_M - 1) / TILE_M);
+    const size_t smem_bytes = flash_assign_smem_bytes_256x128x32();
+    cudaError_t err = cudaFuncSetAttribute(
+        flash_assign_kernel_256x128x32,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)
+    );
+    if (err != cudaSuccess) {
+        return err;
+    }
+    flash_assign_kernel_256x128x32<<<grid, block, smem_bytes, stream>>>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_aligned(
+    const half* A,
+    const half* B_col_major,
+    const float* x_norm,
+    const float* c_norm,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+) {
+    const dim3 block(THREAD_COUNT);
+    const dim3 grid((M + TILE_M - 1) / TILE_M);
+    const size_t smem_bytes = flash_assign_smem_bytes_256x128x32();
+    cudaError_t err = cudaFuncSetAttribute(
+        flash_assign_kernel_256x128x32_aligned,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)
+    );
+    if (err != cudaSuccess) {
+        return err;
+    }
+    flash_assign_kernel_256x128x32_aligned<<<grid, block, smem_bytes, stream>>>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K);
+    return cudaGetLastError();
+}
+
+template <int STATIC_K>
+static cudaError_t launch_flash_assign_kernel_256x128x32_force_aligned_static_k_impl(
+    const half* A,
+    const half* B_col_major,
+    const float* x_norm,
+    const float* c_norm,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+) {
+    const dim3 block(THREAD_COUNT);
+    const dim3 grid((M + TILE_M - 1) / TILE_M);
+    const size_t smem_bytes = flash_assign_smem_bytes_256x128x32();
+    cudaError_t err = cudaFuncSetAttribute(
+        flash_assign_kernel_256x128x32_aligned_static_k<STATIC_K>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)
+    );
+    if (err != cudaSuccess) {
+        return err;
+    }
+    flash_assign_kernel_256x128x32_aligned_static_k<STATIC_K><<<grid, block, smem_bytes, stream>>>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_deferred_generic(
+    const half* A,
+    const half* B_col_major,
+    const float* x_norm,
+    const float* c_norm,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+) {
+    const dim3 block(THREAD_COUNT);
+    const dim3 grid((M + TILE_M - 1) / TILE_M);
+    const size_t smem_bytes = flash_assign_smem_bytes_256x128x32();
+    cudaError_t err = cudaFuncSetAttribute(
+        flash_assign_kernel_256x128x32_aligned_deferred_reduce,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)
+    );
+    if (err != cudaSuccess) {
+        return err;
+    }
+    flash_assign_kernel_256x128x32_aligned_deferred_reduce<<<grid, block, smem_bytes, stream>>>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K);
+    return cudaGetLastError();
+}
+
+template <int STATIC_K>
+static cudaError_t launch_flash_assign_kernel_256x128x32_force_deferred_static_k_impl(
+    const half* A,
+    const half* B_col_major,
+    const float* x_norm,
+    const float* c_norm,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+) {
+    const dim3 block(THREAD_COUNT);
+    const dim3 grid((M + TILE_M - 1) / TILE_M);
+    const size_t smem_bytes = flash_assign_smem_bytes_256x128x32();
+    cudaError_t err = cudaFuncSetAttribute(
+        flash_assign_kernel_256x128x32_aligned_deferred_reduce_static_k<STATIC_K>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(smem_bytes)
+    );
+    if (err != cudaSuccess) {
+        return err;
+    }
+    flash_assign_kernel_256x128x32_aligned_deferred_reduce_static_k<STATIC_K><<<grid, block, smem_bytes, stream>>>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K);
+    return cudaGetLastError();
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_aligned_static_k_128(
+    const half* A, const half* B_col_major, const float* x_norm, const float* c_norm,
+    int* output_ids, float* output_dists, int M, int N, int K, cudaStream_t stream
+) {
+    return launch_flash_assign_kernel_256x128x32_force_aligned_static_k_impl<128>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K, stream);
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_aligned_static_k_256(
+    const half* A, const half* B_col_major, const float* x_norm, const float* c_norm,
+    int* output_ids, float* output_dists, int M, int N, int K, cudaStream_t stream
+) {
+    return launch_flash_assign_kernel_256x128x32_force_aligned_static_k_impl<256>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K, stream);
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_aligned_static_k_512(
+    const half* A, const half* B_col_major, const float* x_norm, const float* c_norm,
+    int* output_ids, float* output_dists, int M, int N, int K, cudaStream_t stream
+) {
+    return launch_flash_assign_kernel_256x128x32_force_aligned_static_k_impl<512>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K, stream);
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_deferred_static_k_128(
+    const half* A, const half* B_col_major, const float* x_norm, const float* c_norm,
+    int* output_ids, float* output_dists, int M, int N, int K, cudaStream_t stream
+) {
+    return launch_flash_assign_kernel_256x128x32_force_deferred_static_k_impl<128>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K, stream);
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_deferred_static_k_256(
+    const half* A, const half* B_col_major, const float* x_norm, const float* c_norm,
+    int* output_ids, float* output_dists, int M, int N, int K, cudaStream_t stream
+) {
+    return launch_flash_assign_kernel_256x128x32_force_deferred_static_k_impl<256>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K, stream);
+}
+
+cudaError_t launch_flash_assign_kernel_256x128x32_force_deferred_static_k_512(
+    const half* A, const half* B_col_major, const float* x_norm, const float* c_norm,
+    int* output_ids, float* output_dists, int M, int N, int K, cudaStream_t stream
+) {
+    return launch_flash_assign_kernel_256x128x32_force_deferred_static_k_impl<512>(
+        A, B_col_major, x_norm, c_norm, output_ids, output_dists, M, N, K, stream);
 }
 
 cudaError_t launch_flash_assign_complete_256x128x32(
