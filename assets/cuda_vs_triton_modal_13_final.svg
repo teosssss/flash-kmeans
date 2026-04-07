@@ -41,47 +41,43 @@
 <line x1="1353.0" y1="90" x2="1353.0" y2="604" stroke="#e5e7eb" stroke-width="1"/>
 <text x="1353.0" y="628" text-anchor="middle" font-size="13" font-family="Helvetica, Arial, sans-serif" fill="#6b7280">3.6</text>
 <line x1="380" y1="604" x2="1380" y2="604" stroke="#9ca3af" stroke-width="1.5"/>
-<text x="362" y="115.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=4,096 N=1,024 K=128</text>
+<text x="362" y="115.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=4,096 K=1,024 D=128</text>
 <rect x="380" y="98.0" width="982.5" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
-<text x="1372.5" y="114.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">3.635x</text>
-<text x="362" y="153.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=8,192 N=2,048 K=128</text>
+<text x="1320.0" y="114.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">3.635x</text>
+<text x="362" y="153.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=8,192 K=2,048 D=128</text>
 <rect x="380" y="136.0" width="473.1" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="863.1" y="152.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.750x</text>
-<text x="362" y="191.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=32,768 N=4,096 K=128</text>
+<text x="362" y="191.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=32,768 K=4,096 D=128</text>
 <rect x="380" y="174.0" width="291.0" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="681.0" y="190.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.077x</text>
-<text x="362" y="229.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=131,072 N=16,384 K=128</text>
+<text x="362" y="229.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=131,072 K=16,384 D=128</text>
 <rect x="380" y="212.0" width="325.6" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="715.6" y="228.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.205x</text>
-<text x="362" y="267.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=4,096 N=1,024 K=256</text>
+<text x="362" y="267.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=4,096 K=1,024 D=256</text>
 <rect x="380" y="250.0" width="588.2" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="978.2" y="266.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">2.176x</text>
-<text x="362" y="305.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=8,192 N=2,048 K=256</text>
+<text x="362" y="305.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=8,192 K=2,048 D=256</text>
 <rect x="380" y="288.0" width="396.6" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="786.6" y="304.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.467x</text>
-<text x="362" y="343.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=32,768 N=4,096 K=256</text>
+<text x="362" y="343.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=32,768 K=4,096 D=256</text>
 <rect x="380" y="326.0" width="435.2" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="825.2" y="342.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.610x</text>
-<text x="362" y="381.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=131,072 N=16,384 K=256</text>
+<text x="362" y="381.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=131,072 K=16,384 D=256</text>
 <rect x="380" y="364.0" width="376.3" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="766.3" y="380.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.392x</text>
-<text x="362" y="419.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=262,144 N=32,768 K=256</text>
+<text x="362" y="419.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=262,144 K=32,768 D=256</text>
 <rect x="380" y="402.0" width="358.5" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="748.5" y="418.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.326x</text>
-<text x="362" y="457.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=4,096 N=1,024 K=512</text>
+<text x="362" y="457.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=4,096 K=1,024 D=512</text>
 <rect x="380" y="440.0" width="502.5" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="892.5" y="456.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.859x</text>
-<text x="362" y="495.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=8,192 N=2,048 K=512</text>
+<text x="362" y="495.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=8,192 K=2,048 D=512</text>
 <rect x="380" y="478.0" width="463.1" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="853.1" y="494.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.714x</text>
-<text x="362" y="533.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=32,768 N=4,096 K=512</text>
+<text x="362" y="533.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=32,768 K=4,096 D=512</text>
 <rect x="380" y="516.0" width="510.8" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="900.8" y="532.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.890x</text>
-<text x="362" y="571.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">M=131,072 N=16,384 K=512</text>
+<text x="362" y="571.0" text-anchor="end" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#374151">N=131,072 K=16,384 D=512</text>
 <rect x="380" y="554.0" width="439.6" height="22" rx="6" fill="#0f766e" opacity="0.92"/>
 <text x="829.6" y="570.0" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">1.626x</text>
-<rect x="1100" y="108" width="240" height="90" rx="10" fill="#ffffff" stroke="#e5e7eb"/>
-<text x="1116" y="136" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">Mean speedup: 1.748x</text>
-<text x="1116" y="158" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">Geomean speedup: 1.667x</text>
-<text x="1116" y="180" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">Best speedup: 3.635x</text>
 </svg>

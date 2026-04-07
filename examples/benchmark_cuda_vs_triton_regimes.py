@@ -70,8 +70,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def shape_label(shape: tuple[int, int, int]) -> str:
-    m, n, k = shape
-    return f"M={m:,} N={n:,} K={k}"
+    n_points, n_centroids, dim = shape
+    return f"N={n_points:,} K={n_centroids:,} D={dim}"
 
 
 def regime_title(name: str) -> str:
@@ -128,17 +128,17 @@ def write_svg(path: Path, summary_rows: list[dict]) -> None:
         )
         return
 
-    width = 1180
-    height = 240 + 110 * len(summary_rows)
+    width = 1040
+    height = 220 + 82 * len(summary_rows)
     left = 280
-    right = 180
+    right = 90
     top = 90
     bottom = 60
     plot_width = width - left - right
     plot_height = height - top - bottom
     bar_h = 28
-    row_gap = 110
-    max_speed = max(row["best_speedup"] for row in summary_rows)
+    row_gap = 82
+    max_speed = max(row["mean_speedup"] for row in summary_rows)
     x_max = max(1.2, math.ceil(max_speed * 10.0) / 10.0)
 
     def x_pos(val: float) -> float:
@@ -148,7 +148,7 @@ def write_svg(path: Path, summary_rows: list[dict]) -> None:
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="#fffdf8"/>',
         f'<text x="{left}" y="36" font-size="28" font-family="Helvetica, Arial, sans-serif" fill="#1f2937">CUDA vs Triton: representative assignment regimes</text>',
-        f'<text x="{left}" y="58" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#4b5563">Bars show mean speedup by regime. Labels on the right show the best point in each regime.</text>',
+        f'<text x="{left}" y="58" font-size="15" font-family="Helvetica, Arial, sans-serif" fill="#4b5563">Bars show mean CUDA speedup over Triton for each representative assignment regime.</text>',
     ]
 
     tick = 0.0
@@ -165,11 +165,8 @@ def write_svg(path: Path, summary_rows: list[dict]) -> None:
         tick += 0.2
 
     for idx, row in enumerate(summary_rows):
-        y = top + idx * row_gap + 30
+        y = top + idx * row_gap + 26
         x_end = x_pos(row["mean_speedup"])
-        best_x = x_pos(row["best_speedup"])
-        mean_label_x = min(x_end + 10, left + plot_width - 120)
-        best_label_x = min(best_x + 12, left + plot_width - 210)
         elements.append(
             f'<text x="{left - 18}" y="{y + 6:.1f}" text-anchor="end" font-size="17" '
             'font-family="Helvetica, Arial, sans-serif" fill="#374151">'
@@ -177,17 +174,8 @@ def write_svg(path: Path, summary_rows: list[dict]) -> None:
         )
         elements.append(f'<rect x="{left}" y="{y - bar_h / 2:.1f}" width="{x_end - left:.1f}" height="{bar_h}" rx="6" fill="#0f766e" opacity="0.92"/>')
         elements.append(
-            f'<text x="{mean_label_x:.1f}" y="{y - 20:.1f}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">'
-            f"mean {row['mean_speedup']:.3f}x</text>"
-        )
-        elements.append(f'<line x1="{best_x:.1f}" y1="{y - 24:.1f}" x2="{best_x:.1f}" y2="{y + 24:.1f}" stroke="#1d4ed8" stroke-width="3"/>')
-        elements.append(
-            f'<text x="{best_label_x:.1f}" y="{y + 28:.1f}" font-size="13" font-family="Helvetica, Arial, sans-serif" fill="#1d4ed8">'
-            f"best {row['best_speedup']:.3f}x</text>"
-        )
-        elements.append(
-            f'<text x="{best_label_x:.1f}" y="{y + 46:.1f}" font-size="12" font-family="Helvetica, Arial, sans-serif" fill="#4b5563">'
-            f"{row['best_shape']}</text>"
+            f'<text x="{min(x_end + 10, left + plot_width - 52):.1f}" y="{y + 5:.1f}" font-size="14" font-family="Helvetica, Arial, sans-serif" fill="#111827">'
+            f"{row['mean_speedup']:.3f}x</text>"
         )
 
     elements.append("</svg>")

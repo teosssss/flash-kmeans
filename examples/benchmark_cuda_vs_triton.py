@@ -130,8 +130,8 @@ def make_inputs(num_points: int, num_centroids: int, dim: int, seed: int) -> tup
 
 
 def shape_label(shape: tuple[int, int, int]) -> str:
-    m, n, k = shape
-    return f"M={m:,} N={n:,} K={k}"
+    n_points, n_centroids, dim = shape
+    return f"N={n_points:,} K={n_centroids:,} D={dim}"
 
 
 def kernel_sort_key(name: str) -> tuple[int, str]:

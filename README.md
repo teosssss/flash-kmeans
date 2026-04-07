@@ -63,15 +63,15 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 
 ### CUDA flash-assign vs Triton
 
-We benchmarked the CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a 13-shape sweep covering `K in {128, 256, 512}`. For each shape, we report the fastest CUDA kernel among `generic_main`, `aligned_generic_main`, `aligned_static_main`, `deferred_generic`, and `deferred_static`.
+We benchmarked the CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a 13-shape sweep covering `D in {128, 256, 512}`. Here `N` is the number of points, `K` is the number of centroids, and `D` is the feature dimension. For each shape, we report the fastest CUDA kernel among `generic_main`, `aligned_generic_main`, `aligned_static_main`, `deferred_generic`, and `deferred_static`.
 
 Across this sweep, the best CUDA kernel per shape won on all 13 tested shapes:
   - mean speedup: `1.748x`
   - geometric-mean speedup: `1.667x`
-  - best speedup: `3.635x` on `M=4,096, N=1,024, K=128`
-  - worst speedup: `1.077x` on `M=32,768, N=4,096, K=128`
+  - best speedup: `3.635x` on `N=4,096, K=1,024, D=128`
+  - worst speedup: `1.077x` on `N=32,768, K=4,096, D=128`
 
-The strongest kernel is shape-dependent. `deferred_generic` remains the most reliable general-purpose variant, `deferred_static` wins the smallest `K=128` cases in this run, and `aligned_generic_main` is strongest on several aligned medium and large shapes.
+The strongest kernel is shape-dependent. `deferred_generic` remains the most reliable general-purpose variant, `deferred_static` wins the smallest `D=128` cases in this run, and `aligned_generic_main` is strongest on several aligned medium and large shapes.
 
 A `3.635x` speedup here means `3.635x` over Triton, not over the older baselines above. Since Flash-KMeans Triton already reports up to `17.9x` over the best prior baselines, `33x` over cuML, and `200x+` over FAISS, this implies roughly `65.1x`, `120.0x`, and `727.1x` stacked speedups at the best point, or about `31.3x`, `57.7x`, and `349.6x` using the mean CUDA gain (`1.748x`). These stacked numbers are directional only, since the Triton paper results and this CUDA benchmark were not measured on the same hardware and benchmark suite.
 
@@ -81,19 +81,19 @@ The exact best-vs-best results from this Modal run are:
 
 | Shape | Best CUDA kernel | CUDA ms | Triton ms | Speedup |
 | --- | --- | ---: | ---: | ---: |
-| `M=4,096 N=1,024 K=128` | `deferred_static` | 0.057 | 0.206 | 3.635x |
-| `M=8,192 N=2,048 K=128` | `deferred_static` | 0.115 | 0.201 | 1.750x |
-| `M=32,768 N=4,096 K=128` | `deferred_generic` | 0.769 | 0.828 | 1.077x |
-| `M=131,072 N=16,384 K=128` | `aligned_generic_main` | 10.907 | 13.139 | 1.205x |
-| `M=4,096 N=1,024 K=256` | `deferred_generic` | 0.091 | 0.197 | 2.176x |
-| `M=8,192 N=2,048 K=256` | `aligned_generic_main` | 0.191 | 0.281 | 1.467x |
-| `M=32,768 N=4,096 K=256` | `deferred_generic` | 1.370 | 2.206 | 1.610x |
-| `M=131,072 N=16,384 K=256` | `deferred_generic` | 18.846 | 26.240 | 1.392x |
-| `M=262,144 N=32,768 K=256` | `deferred_generic` | 74.662 | 99.031 | 1.326x |
-| `M=4,096 N=1,024 K=512` | `deferred_generic` | 0.158 | 0.294 | 1.859x |
-| `M=8,192 N=2,048 K=512` | `aligned_generic_main` | 0.380 | 0.652 | 1.714x |
-| `M=32,768 N=4,096 K=512` | `aligned_generic_main` | 2.671 | 5.048 | 1.890x |
-| `M=131,072 N=16,384 K=512` | `deferred_generic` | 36.332 | 59.092 | 1.626x |
+| `N=4,096 K=1,024 D=128` | `deferred_static` | 0.057 | 0.206 | 3.635x |
+| `N=8,192 K=2,048 D=128` | `deferred_static` | 0.115 | 0.201 | 1.750x |
+| `N=32,768 K=4,096 D=128` | `deferred_generic` | 0.769 | 0.828 | 1.077x |
+| `N=131,072 K=16,384 D=128` | `aligned_generic_main` | 10.907 | 13.139 | 1.205x |
+| `N=4,096 K=1,024 D=256` | `deferred_generic` | 0.091 | 0.197 | 2.176x |
+| `N=8,192 K=2,048 D=256` | `aligned_generic_main` | 0.191 | 0.281 | 1.467x |
+| `N=32,768 K=4,096 D=256` | `deferred_generic` | 1.370 | 2.206 | 1.610x |
+| `N=131,072 K=16,384 D=256` | `deferred_generic` | 18.846 | 26.240 | 1.392x |
+| `N=262,144 K=32,768 D=256` | `deferred_generic` | 74.662 | 99.031 | 1.326x |
+| `N=4,096 K=1,024 D=512` | `deferred_generic` | 0.158 | 0.294 | 1.859x |
+| `N=8,192 K=2,048 D=512` | `aligned_generic_main` | 0.380 | 0.652 | 1.714x |
+| `N=32,768 K=4,096 D=512` | `aligned_generic_main` | 2.671 | 5.048 | 1.890x |
+| `N=131,072 K=16,384 D=512` | `deferred_generic` | 36.332 | 59.092 | 1.626x |
 
 This repository also includes a dedicated benchmark for rerunning or extending the comparison:
 
@@ -104,15 +104,15 @@ python3 examples/benchmark_cuda_vs_triton.py \
 
 #### Representative Assignment Regimes
 
-We also grouped assignment-only CUDA vs Triton results into three representative regimes, analogous to the workload breakdown used in the Flash-KMeans paper: `large_m_large_n`, `large_m_small_n`, and `small_m_small_n`. This benchmark still measures only the assignment kernel, not end-to-end k-means.
+We also grouped assignment-only CUDA vs Triton results into three representative regimes, analogous to the workload breakdown used in the Flash-KMeans paper: `large-N large-K`, `large-N small-K`, and `small-N small-K`. This benchmark still measures only the assignment kernel, not end-to-end k-means.
 
 On a reduced Modal L4 sweep, CUDA won on all tested shapes in every regime:
 
 | Regime | Shapes | CUDA wins | Mean speedup | Geomean | Best speedup |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `large_m_large_n` | 4 | 4/4 | 1.370x | 1.367x | 1.506x |
-| `large_m_small_n` | 4 | 4/4 | 2.234x | 2.225x | 2.414x |
-| `small_m_small_n` | 4 | 4/4 | 2.413x | 2.220x | 3.381x |
+| `large-N large-K` | 4 | 4/4 | 1.370x | 1.367x | 1.506x |
+| `large-N small-K` | 4 | 4/4 | 2.234x | 2.225x | 2.414x |
+| `small-N small-K` | 4 | 4/4 | 2.413x | 2.220x | 3.381x |
 
 This regime view makes the trend clearer: the CUDA kernels still improve on Triton in large memory-intensive shapes, but the strongest gains show up in the lower-`N` or lower-centroid-count regimes where the CUDA path sustains much higher assignment throughput.
 
