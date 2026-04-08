@@ -63,7 +63,11 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 
 ### CUDA flash-assign vs Triton
 
-We benchmarked the CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a 13-shape sweep covering `D in {128, 256, 512}`. Here `N` is the number of points, `K` is the number of centroids, and `D` is the feature dimension. For each shape, we report the fastest CUDA kernel among `generic_main`, `aligned_generic_main`, `aligned_static_main`, `deferred_generic`, and `deferred_static`.
+I also implemented a CUDA flash-assign path based on the tensor-core pipeline developed in my [Ampere-Gemm](https://github.com/teosssss/Ampere-Gemm) repository. The CUDA kernels reuse the same Ampere-oriented design ideas: `cp.async` staging, WMMA tensor-core MMA, register-resident partial reductions, and aggressive specialization for regular shapes.
+
+This CUDA path currently includes four main implementation ideas. `generic_main` is the baseline tensor-core pipeline with asynchronous shared-memory staging and explicit tail handling. `aligned_generic_main` removes edge guards for aligned shapes, making the load and compute path cheaper. `aligned_static_main` adds compile-time specialization for common `D` values (`128/256/512`) so the compiler can unroll the inner loop more aggressively. `deferred_generic` and `deferred_static` defer the row-min writeback so more of the reduction stays in registers, with `deferred_static` combining that strategy with static-`D` specialization.
+
+We benchmarked these CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a 13-shape sweep covering `D in {128, 256, 512}`. Here `N` is the number of points, `K` is the number of centroids, and `D` is the feature dimension.
 
 Across this sweep, the best CUDA kernel per shape won on all 13 tested shapes:
   - mean speedup: `1.748x`
@@ -117,16 +121,6 @@ On a reduced Modal L4 sweep, CUDA won on all tested shapes in every regime:
 This regime view makes the trend clearer: the CUDA kernels still improve on Triton in large memory-intensive shapes, but the strongest gains show up in the lower-`N` or lower-centroid-count regimes where the CUDA path sustains much higher assignment throughput.
 
 ![CUDA vs Triton representative regimes](assets/cuda_vs_triton_regimes_modal.svg)
-
-#### CUDA kernel notes
-
-| Kernel | Main optimization ideas |
-| --- | --- |
-| `generic_main` | `cp.async` triple buffering over `K`, WMMA tensor-core MMA, register-resident partial minima, shared-memory row reduction, explicit tail handling for non-aligned tiles. |
-| `aligned_generic_main` | Same pipeline as `generic_main`, but removes edge guards on aligned shapes so the load path is cheaper and more regular. |
-| `aligned_static_main` | Adds compile-time specialization for common `K` values (`128/256/512`) so the compiler can unroll the `K` loop more aggressively and simplify address arithmetic. |
-| `deferred_generic` | Keeps the tensor-core tiled pipeline, but defers the row-min writeback so more of the distance reduction stays in registers before shared-memory merge. |
-| `deferred_static` | Combines deferred reduction with static-`K` specialization; this is the highest-ceiling version on the common aligned shapes. |
 
 
 ## Citation
