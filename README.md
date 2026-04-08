@@ -61,11 +61,13 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 
 ![benchmark large N](assets/benchmark_large.png)
 
-### CUDA flash-assign vs Triton
+### CUDA
 
 This repository also contains a CUDA flash-assign implementation based on the tensor-core pipeline from [Ampere-Gemm](https://github.com/teosssss/Ampere-Gemm).
 
 The CUDA path includes four main variants: `generic_main`, `aligned_generic_main`, `aligned_static_main`, and the deferred-reduction family (`deferred_generic` / `deferred_static`). They combine `cp.async` staging, WMMA tensor-core MMA, register-resident partial reductions, aligned fast paths, and static specialization for common `D` values (`128/256/512`).
+
+#### Triton vs CUDA
 
 We benchmarked these CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a 13-shape sweep covering `D in {128, 256, 512}`. Here `N` is the number of points, `K` is the number of centroids, and `D` is the feature dimension.
 
