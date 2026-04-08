@@ -63,9 +63,9 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 
 ### CUDA flash-assign vs Triton
 
-I also implemented a CUDA flash-assign path based on the tensor-core pipeline developed in my [Ampere-Gemm](https://github.com/teosssss/Ampere-Gemm) repository. The CUDA kernels reuse the same Ampere-oriented design ideas: `cp.async` staging, WMMA tensor-core MMA, register-resident partial reductions, and aggressive specialization for regular shapes.
+This repository also contains a CUDA flash-assign implementation based on the tensor-core pipeline from [Ampere-Gemm](https://github.com/teosssss/Ampere-Gemm).
 
-This CUDA path currently includes four main implementation ideas. `generic_main` is the baseline tensor-core pipeline with asynchronous shared-memory staging and explicit tail handling. `aligned_generic_main` removes edge guards for aligned shapes, making the load and compute path cheaper. `aligned_static_main` adds compile-time specialization for common `D` values (`128/256/512`) so the compiler can unroll the inner loop more aggressively. `deferred_generic` and `deferred_static` defer the row-min writeback so more of the reduction stays in registers, with `deferred_static` combining that strategy with static-`D` specialization.
+The CUDA path includes four main variants: `generic_main`, `aligned_generic_main`, `aligned_static_main`, and the deferred-reduction family (`deferred_generic` / `deferred_static`). They combine `cp.async` staging, WMMA tensor-core MMA, register-resident partial reductions, aligned fast paths, and static specialization for common `D` values (`128/256/512`).
 
 We benchmarked these CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a 13-shape sweep covering `D in {128, 256, 512}`. Here `N` is the number of points, `K` is the number of centroids, and `D` is the feature dimension.
 
