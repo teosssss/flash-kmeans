@@ -217,6 +217,42 @@ __device__ __forceinline__ void arrive(uint64_t* bar, uint32_t count = 1) {
 #endif
 }
 
+__device__ __forceinline__ uint32_t cluster_rank() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    uint32_t rank = 0;
+    asm volatile("mov.u32 %0, %%cluster_ctarank;\n" : "=r"(rank));
+    return rank;
+#else
+    return 0;
+#endif
+}
+
+__device__ __forceinline__ void cluster_sync() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("barrier.cluster.arrive;\n" : : : "memory");
+    asm volatile("barrier.cluster.wait;\n" : : : "memory");
+#endif
+}
+
+__device__ __forceinline__ void arrive_cluster(uint64_t* bar, uint32_t cta_id, uint32_t count = 1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    const uint32_t smem_addr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    asm volatile(
+        "{\n\t"
+        ".reg .b32 remAddr32;\n\t"
+        "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+        "mbarrier.arrive.shared::cluster.b64 _, [remAddr32], %2;\n\t"
+        "}"
+        :
+        : "r"(smem_addr), "r"(cta_id), "r"(count)
+        : "memory");
+#else
+    (void)bar;
+    (void)cta_id;
+    (void)count;
+#endif
+}
+
 template <typename T>
 __device__ __forceinline__ void zero_fill(T* dst, int count) {
     #pragma unroll
@@ -267,7 +303,7 @@ __host__ inline CUtensorMap create_tensor_map(const half* gmem_ptr, int global_h
         smem_box_stride,
         CU_TENSOR_MAP_INTERLEAVE_NONE,
         CU_TENSOR_MAP_SWIZZLE_128B,
-        CU_TENSOR_MAP_L2_PROMOTION_NONE,
+        CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
         CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
     if (result != CUDA_SUCCESS) {
         std::abort();
@@ -292,6 +328,34 @@ __device__ __forceinline__ void load_async(half* dst, const void* src_tma_map, u
     (void)bar;
     (void)global_col_idx;
     (void)global_row_idx;
+#endif
+}
+
+__device__ __forceinline__ void load_async_multicast(
+    half* dst,
+    const void* src_tma_map,
+    uint64_t* bar,
+    int global_col_idx,
+    int global_row_idx,
+    uint16_t cluster_mask
+) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    const uint64_t tma_ptr = reinterpret_cast<uint64_t>(src_tma_map);
+    const uint32_t mbar_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(bar));
+    const uint32_t dst_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(dst));
+    asm volatile(
+        "cp.async.bulk.tensor.5d.shared::cluster.global.tile.mbarrier::complete_tx::bytes.multicast::cluster "
+        "[%0], [%1, {%3, %4, %5, 0, 0}], [%2], %6;"
+        :
+        : "r"(dst_ptr), "l"(tma_ptr), "r"(mbar_ptr), "n"(0), "r"(global_row_idx), "r"(global_col_idx / 64), "h"(cluster_mask)
+        : "memory");
+#else
+    (void)dst;
+    (void)src_tma_map;
+    (void)bar;
+    (void)global_col_idx;
+    (void)global_row_idx;
+    (void)cluster_mask;
 #endif
 }
 

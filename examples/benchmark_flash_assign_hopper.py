@@ -13,7 +13,15 @@ from flash_kmeans.assign_euclid_triton import euclid_assign_triton
 
 ROOT = Path(__file__).resolve().parents[1]
 CSRC = ROOT / "flash_kmeans" / "csrc" / "hopper"
-KERNELS = ["hopper_k5_k7_v1", "hopper_k5_k7_wgmma256", "hopper_k5_k7_wgmma256_acache"]
+KERNELS = [
+    "hopper_k5_k7_v1",
+    "hopper_k5_k7_wgmma256",
+    "hopper_k5_k7_wgmma256_nomins",
+    "hopper_k5_k7_wgmma256_acache",
+    "hopper_k5_k7_wgmma256_persistent",
+    "hopper_k5_k7_wgmma256_persistent_cluster4",
+    "hopper_k5_k7_wgmma256_persistent_cluster8",
+]
 
 SHAPES = [
     (4096, 1024, 128),
@@ -158,8 +166,16 @@ def main():
                 hopper_run, ids, dists, point_norms, centroid_norms = make_hopper_assign_only(ext, points, centroids, kernel_name)
                 hopper_run()
                 torch.cuda.synchronize()
-                mismatch = int(torch.ne(ids.cpu(), ref.cpu()).sum().item())
-                if kernel_name in ("hopper_k5_k7_wgmma256", "hopper_k5_k7_wgmma256_acache"):
+                check_correctness = kernel_name != "hopper_k5_k7_wgmma256_nomins"
+                mismatch = int(torch.ne(ids.cpu(), ref.cpu()).sum().item()) if check_correctness else -1
+                if kernel_name in (
+                    "hopper_k5_k7_wgmma256",
+                    "hopper_k5_k7_wgmma256_nomins",
+                    "hopper_k5_k7_wgmma256_acache",
+                    "hopper_k5_k7_wgmma256_persistent",
+                    "hopper_k5_k7_wgmma256_persistent_cluster4",
+                    "hopper_k5_k7_wgmma256_persistent_cluster8",
+                ):
                     cuda_ms = ext.flash_assign_hopper_bench_precomputed_cuda(
                         points,
                         centroids,
@@ -180,7 +196,7 @@ def main():
                     f"event_ms={cuda_ms:.3f} "
                     f"wall_ms={wall_ms:.3f} "
                     f"speedup={triton_ms / cuda_ms:.3f} "
-                    f"mismatch={mismatch}"
+                    f"mismatch={mismatch if check_correctness else 'skipped'}"
                 )
 
         if args.mode in ("full", "both"):

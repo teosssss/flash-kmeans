@@ -52,7 +52,59 @@ cudaError_t launch_flash_assign_hopper_k5_k7_wgmma256(
     cudaStream_t stream
 );
 
+cudaError_t launch_flash_assign_hopper_k5_k7_wgmma256_nomins(
+    const half* points,
+    const half* centroids,
+    const float* point_norms,
+    const float* centroid_norms,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+);
+
 cudaError_t launch_flash_assign_hopper_k5_k7_wgmma256_acache(
+    const half* points,
+    const half* centroids,
+    const float* point_norms,
+    const float* centroid_norms,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+);
+
+cudaError_t launch_flash_assign_hopper_k5_k7_wgmma256_persistent(
+    const half* points,
+    const half* centroids,
+    const float* point_norms,
+    const float* centroid_norms,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+);
+
+cudaError_t launch_flash_assign_hopper_k5_k7_wgmma256_persistent_cluster4(
+    const half* points,
+    const half* centroids,
+    const float* point_norms,
+    const float* centroid_norms,
+    int* output_ids,
+    float* output_dists,
+    int M,
+    int N,
+    int K,
+    cudaStream_t stream
+);
+
+cudaError_t launch_flash_assign_hopper_k5_k7_wgmma256_persistent_cluster8(
     const half* points,
     const half* centroids,
     const float* point_norms,
@@ -98,7 +150,11 @@ void check_common_inputs(const torch::Tensor& points, const torch::Tensor& centr
     TORCH_CHECK(
         kernel_name == "hopper_k5_k7_v1" ||
             kernel_name == "hopper_k5_k7_wgmma256" ||
-            kernel_name == "hopper_k5_k7_wgmma256_acache",
+            kernel_name == "hopper_k5_k7_wgmma256_nomins" ||
+            kernel_name == "hopper_k5_k7_wgmma256_acache" ||
+            kernel_name == "hopper_k5_k7_wgmma256_persistent" ||
+            kernel_name == "hopper_k5_k7_wgmma256_persistent_cluster4" ||
+            kernel_name == "hopper_k5_k7_wgmma256_persistent_cluster8",
         "Unknown Hopper kernel_name: ",
         kernel_name);
 }
@@ -145,6 +201,62 @@ cudaError_t launch_assign_by_name(
             stream
         );
     }
+    if (kernel_name == "hopper_k5_k7_wgmma256_nomins") {
+        return flash_kmeans::hopper::launch_flash_assign_hopper_k5_k7_wgmma256_nomins(
+            reinterpret_cast<const half*>(points.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(centroids.data_ptr<at::Half>()),
+            point_norms.data_ptr<float>(),
+            centroid_norms.data_ptr<float>(),
+            output_ids.data_ptr<int>(),
+            output_dists.data_ptr<float>(),
+            num_points,
+            num_centroids,
+            dim,
+            stream
+        );
+    }
+    if (kernel_name == "hopper_k5_k7_wgmma256_persistent") {
+        return flash_kmeans::hopper::launch_flash_assign_hopper_k5_k7_wgmma256_persistent(
+            reinterpret_cast<const half*>(points.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(centroids.data_ptr<at::Half>()),
+            point_norms.data_ptr<float>(),
+            centroid_norms.data_ptr<float>(),
+            output_ids.data_ptr<int>(),
+            output_dists.data_ptr<float>(),
+            num_points,
+            num_centroids,
+            dim,
+            stream
+        );
+    }
+    if (kernel_name == "hopper_k5_k7_wgmma256_persistent_cluster4") {
+        return flash_kmeans::hopper::launch_flash_assign_hopper_k5_k7_wgmma256_persistent_cluster4(
+            reinterpret_cast<const half*>(points.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(centroids.data_ptr<at::Half>()),
+            point_norms.data_ptr<float>(),
+            centroid_norms.data_ptr<float>(),
+            output_ids.data_ptr<int>(),
+            output_dists.data_ptr<float>(),
+            num_points,
+            num_centroids,
+            dim,
+            stream
+        );
+    }
+    if (kernel_name == "hopper_k5_k7_wgmma256_persistent_cluster8") {
+        return flash_kmeans::hopper::launch_flash_assign_hopper_k5_k7_wgmma256_persistent_cluster8(
+            reinterpret_cast<const half*>(points.data_ptr<at::Half>()),
+            reinterpret_cast<const half*>(centroids.data_ptr<at::Half>()),
+            point_norms.data_ptr<float>(),
+            centroid_norms.data_ptr<float>(),
+            output_ids.data_ptr<int>(),
+            output_dists.data_ptr<float>(),
+            num_points,
+            num_centroids,
+            dim,
+            stream
+        );
+    }
     return flash_kmeans::hopper::launch_flash_assign_hopper_k5_k7_wgmma256_acache(
         reinterpret_cast<const half*>(points.data_ptr<at::Half>()),
         reinterpret_cast<const half*>(centroids.data_ptr<at::Half>()),
@@ -165,8 +277,20 @@ int hopper_kernel_variant(const std::string& kernel_name) {
     if (kernel_name == "hopper_k5_k7_wgmma256") {
         return 0;
     }
-    if (kernel_name == "hopper_k5_k7_wgmma256_acache") {
+    if (kernel_name == "hopper_k5_k7_wgmma256_nomins") {
         return 1;
+    }
+    if (kernel_name == "hopper_k5_k7_wgmma256_acache") {
+        return 2;
+    }
+    if (kernel_name == "hopper_k5_k7_wgmma256_persistent") {
+        return 3;
+    }
+    if (kernel_name == "hopper_k5_k7_wgmma256_persistent_cluster4") {
+        return 4;
+    }
+    if (kernel_name == "hopper_k5_k7_wgmma256_persistent_cluster8") {
+        return 5;
     }
     return -1;
 }
