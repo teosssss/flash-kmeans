@@ -65,9 +65,9 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 
 ## CUDA Flash-Assign
 
-This repository also contains a CUDA flash-assign implementation based on the tensor-core pipeline from [Ampere-Gemm](https://github.com/teosssss/Ampere-Gemm).
+This repository also contains a CUDA flash-assign implementation based on the tensor-core pipeline from [Ampere-Gemm](https://github.com/teosssss/Ampere-Gemm) and [Hopper-Gemm](https://github.com/pranjalssh/fast.cu/blob/main/README.md).
 
-#### CUDA Kernels
+#### CUDA Kernels for Pre-hopper architectures
 
 | Kernel | Main optimization ideas |
 | --- | --- |
@@ -77,7 +77,7 @@ This repository also contains a CUDA flash-assign implementation based on the te
 | `deferred_generic` | Keeps the tiled tensor-core pipeline, but defers the row-min writeback so more of the reduction stays in registers before the final merge. |
 | `deferred_static` | Combines deferred reduction with static-`D` specialization for the highest ceiling on common aligned shapes. |
 
-### Triton vs CUDA
+### Triton vs CUDA Pre-hopper
 
 We benchmarked these CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a sweep covering `D in {128, 256, 512}`.
 
@@ -92,9 +92,20 @@ python3 examples/benchmark_cuda_vs_triton.py \
   --out-dir /path/to/output_dir
 ```
 
+
+#### Representative Assignment Regimes
+
+We also grouped assignment-only CUDA vs Triton results into three representative regimes, analogous to the workload breakdown used in the Flash-KMeans paper: `large-N large-K`, `large-N small-K`, and `small-N small-K`. This benchmark still measures only the assignment kernel, not end-to-end k-means.
+
+This regime view makes the trend clearer: the CUDA kernels still improve on Triton in large memory-intensive shapes, but the strongest gains show up in the lower-`N` or lower-centroid-count regimes where the CUDA path sustains much higher assignment throughput.
+
+![CUDA vs Triton representative regimes](assets/cuda_vs_triton_regimes_modal.svg)
+
+
+
 #### Hopper Experiments
 
-Hopper-specific CUDA experiments live under [`flash_kmeans/csrc/hopper`](flash_kmeans/csrc/hopper/). The current kernels are additive and kept separate from the production Ampere/Ada path:
+Hopper-specific CUDA kernels live under [`flash_kmeans/csrc/hopper`](flash_kmeans/csrc/hopper/). The current kernels are additive and kept separate from the production Ampere/Ada path:
 
 | Kernel | Main optimization ideas |
 | --- | --- |
@@ -128,15 +139,6 @@ python3 examples/benchmark_flash_assign_hopper.py \
   --cases 4096,1024,128 8192,2048,256 16384,2048,512 32768,4096,256 32768,4096,512 \
   --kernels hopper_k5_k7_wgmma256 hopper_k5_k7_wgmma256_persistent hopper_k5_k7_wgmma256_persistent_cluster4 hopper_k5_k7_wgmma256_persistent_cluster8
 ```
-
-#### Representative Assignment Regimes
-
-We also grouped assignment-only CUDA vs Triton results into three representative regimes, analogous to the workload breakdown used in the Flash-KMeans paper: `large-N large-K`, `large-N small-K`, and `small-N small-K`. This benchmark still measures only the assignment kernel, not end-to-end k-means.
-
-This regime view makes the trend clearer: the CUDA kernels still improve on Triton in large memory-intensive shapes, but the strongest gains show up in the lower-`N` or lower-centroid-count regimes where the CUDA path sustains much higher assignment throughput.
-
-![CUDA vs Triton representative regimes](assets/cuda_vs_triton_regimes_modal.svg)
-
 
 ## Citation
 
