@@ -63,11 +63,11 @@ Input tensor is generated randomly in CPU pinned memory. both flash-kmeans and f
 
 ![benchmark large N](assets/benchmark_large.png)
 
-### CUDA
+## CUDA Flash-Assign
 
 This repository also contains a CUDA flash-assign implementation based on the tensor-core pipeline from [Ampere-Gemm](https://github.com/teosssss/Ampere-Gemm).
 
-#### CUDA Kernel
+#### CUDA Kernels
 
 | Kernel | Main optimization ideas |
 | --- | --- |
@@ -77,39 +77,13 @@ This repository also contains a CUDA flash-assign implementation based on the te
 | `deferred_generic` | Keeps the tiled tensor-core pipeline, but defers the row-min writeback so more of the reduction stays in registers before the final merge. |
 | `deferred_static` | Combines deferred reduction with static-`D` specialization for the highest ceiling on common aligned shapes. |
 
-#### Triton vs CUDA
+### Triton vs CUDA
 
-We benchmarked these CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a 13-shape sweep covering `D in {128, 256, 512}`. Here `N` is the number of points, `K` is the number of centroids, and `D` is the feature dimension.
+We benchmarked these CUDA flash-assign kernels against the Triton `euclid_assign_triton` baseline on Modal with an NVIDIA L4 GPU, FP16 inputs, and a sweep covering `D in {128, 256, 512}`.
 
-Across this sweep, the best CUDA kernel per shape won on all 13 tested shapes:
-  - mean speedup: `1.748x`
-  - geometric-mean speedup: `1.667x`
-  - best speedup: `3.635x` on `N=4,096, K=1,024, D=128`
-  - worst speedup: `1.077x` on `N=32,768, K=4,096, D=128`
-
-The strongest kernel is shape-dependent. `deferred_generic` remains the most reliable general-purpose variant, `deferred_static` wins the smallest `D=128` cases in this run, and `aligned_generic_main` is strongest on several aligned medium and large shapes.
-
-A `3.635x` speedup here means `3.635x` over Triton, not over the older baselines above. Since Flash-KMeans Triton already reports up to `17.9x` over the best prior baselines, `33x` over cuML, and `200x+` over FAISS, this implies roughly `65.1x`, `120.0x`, and `727.1x` stacked speedups at the best point, or about `31.3x`, `57.7x`, and `349.6x` using the mean CUDA gain (`1.748x`). These stacked numbers are directional only, since the Triton paper results and this CUDA benchmark were not measured on the same hardware and benchmark suite.
+The strongest kernel is shape-dependent. `deferred_generic` remains the most reliable general-purpose variant, `deferred_static` is strongest on some small aligned `D=128` cases, and `aligned_generic_main` is competitive on several aligned medium and large shapes.
 
 ![CUDA vs Triton speedup](assets/cuda_vs_triton_modal_13_final.svg)
-
-The exact best-vs-best results from this Modal run are:
-
-| Shape | Best CUDA kernel | CUDA ms | Triton ms | Speedup |
-| --- | --- | ---: | ---: | ---: |
-| `N=4,096 K=1,024 D=128` | `deferred_static` | 0.057 | 0.206 | 3.635x |
-| `N=8,192 K=2,048 D=128` | `deferred_static` | 0.115 | 0.201 | 1.750x |
-| `N=32,768 K=4,096 D=128` | `deferred_generic` | 0.769 | 0.828 | 1.077x |
-| `N=131,072 K=16,384 D=128` | `aligned_generic_main` | 10.907 | 13.139 | 1.205x |
-| `N=4,096 K=1,024 D=256` | `deferred_generic` | 0.091 | 0.197 | 2.176x |
-| `N=8,192 K=2,048 D=256` | `aligned_generic_main` | 0.191 | 0.281 | 1.467x |
-| `N=32,768 K=4,096 D=256` | `deferred_generic` | 1.370 | 2.206 | 1.610x |
-| `N=131,072 K=16,384 D=256` | `deferred_generic` | 18.846 | 26.240 | 1.392x |
-| `N=262,144 K=32,768 D=256` | `deferred_generic` | 74.662 | 99.031 | 1.326x |
-| `N=4,096 K=1,024 D=512` | `deferred_generic` | 0.158 | 0.294 | 1.859x |
-| `N=8,192 K=2,048 D=512` | `aligned_generic_main` | 0.380 | 0.652 | 1.714x |
-| `N=32,768 K=4,096 D=512` | `aligned_generic_main` | 2.671 | 5.048 | 1.890x |
-| `N=131,072 K=16,384 D=512` | `deferred_generic` | 36.332 | 59.092 | 1.626x |
 
 This repository also includes a dedicated benchmark for rerunning or extending the comparison:
 
@@ -138,13 +112,13 @@ The current Hopper experiments were benchmarked on Modal with an NVIDIA H100 GPU
 
 Representative H100 results from `examples/benchmark_flash_assign_hopper.py`:
 
-| Shape | Triton ms | `wgmma256` | `persistent` | `cluster4` | `cluster8` |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `N=4,096 K=1,024 D=128` | 0.036 | 0.016 | 0.016 | 0.017 | 0.017 |
-| `N=8,192 K=2,048 D=256` | 0.047 | 0.037 | 0.037 | 0.039 | 0.039 |
-| `N=16,384 K=2,048 D=512` | 0.154 | 0.058 | 0.057 | 0.112 | 0.114 |
-| `N=32,768 K=4,096 D=256` | 0.230 | 0.137 | 0.135 | 0.277 | 0.282 |
-| `N=32,768 K=4,096 D=512` | 0.582 | 0.217 | 0.216 | 0.425 | 0.428 |
+| Shape | Triton ms | `wgmma256` | `wgmma256` speedup | `persistent` | `persistent` speedup | `cluster4` | `cluster4` speedup | `cluster8` | `cluster8` speedup |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `N=4,096 K=1,024 D=128` | 0.036 | 0.016 | 2.266x | 0.016 | 2.274x | 0.017 | 2.110x | 0.017 | 2.103x |
+| `N=8,192 K=2,048 D=256` | 0.047 | 0.037 | 1.261x | 0.037 | 1.264x | 0.039 | 1.212x | 0.039 | 1.209x |
+| `N=16,384 K=2,048 D=512` | 0.154 | 0.058 | 2.668x | 0.057 | 2.676x | 0.112 | 1.372x | 0.114 | 1.353x |
+| `N=32,768 K=4,096 D=256` | 0.230 | 0.137 | 1.675x | 0.135 | 1.699x | 0.277 | 0.830x | 0.282 | 0.815x |
+| `N=32,768 K=4,096 D=512` | 0.582 | 0.217 | 2.678x | 0.216 | 2.690x | 0.425 | 1.368x | 0.428 | 1.360x |
 
 You can rerun the Hopper sweep with:
 
@@ -158,14 +132,6 @@ python3 examples/benchmark_flash_assign_hopper.py \
 #### Representative Assignment Regimes
 
 We also grouped assignment-only CUDA vs Triton results into three representative regimes, analogous to the workload breakdown used in the Flash-KMeans paper: `large-N large-K`, `large-N small-K`, and `small-N small-K`. This benchmark still measures only the assignment kernel, not end-to-end k-means.
-
-On a reduced Modal L4 sweep, CUDA won on all tested shapes in every regime:
-
-| Regime | Shapes | CUDA wins | Mean speedup | Geomean | Best speedup |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `large-N large-K` | 4 | 4/4 | 1.370x | 1.367x | 1.506x |
-| `large-N small-K` | 4 | 4/4 | 2.234x | 2.225x | 2.414x |
-| `small-N small-K` | 4 | 4/4 | 2.413x | 2.220x | 3.381x |
 
 This regime view makes the trend clearer: the CUDA kernels still improve on Triton in large memory-intensive shapes, but the strongest gains show up in the lower-`N` or lower-centroid-count regimes where the CUDA path sustains much higher assignment throughput.
 
